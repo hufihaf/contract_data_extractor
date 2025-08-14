@@ -1,5 +1,5 @@
 import fitz # this is a dependancy that needs to be downloaded
-import pandas as pd # ditto
+import pandas as pd
 import re
 import os
 from pathlib import Path 
@@ -50,9 +50,8 @@ def process_all_pdfs(input_root):
 
 # grabs the data from tables in a mod doc. Under construction
 def mod(document):
-    print("Skipping modifications for now")
+    print("goomba")
 
-# grabs the data from tables in an award doc
 def award(document):
     columns = ["SLIN", "ACRN", "Unit", "Cost", "Qty", "Obligation", "Action Type", "CIN", "Funding Doc", "Purchase Req No"]
     df = pd.DataFrame(columns=columns)
@@ -64,19 +63,14 @@ def award(document):
     order_number = extract_underneath(first_page, order_number_id, dx=5, dy=10)
     contractor_name = extract_underneath(first_page, contractor_name_id, dx=5, dy=10)
 
-    # Loop through pages, find SLINs
+    # ---- PASS 1: Build initial table ----
     for page in document:
         slin_instances = page.search_for(slin_id)
         for slin_inst in slin_instances:
             x0, y0, x1, y1 = slin_inst
-            
-            # gather the SLIN
             slin_value = page.get_textbox((x0-5, y1, x1, y1+12)).strip() or ""
-
-            # Search rectangle to the right of SLIN (500x220 points)
             search_rect = fitz.Rect(x1, y0, x1 + 500, y0 + 220)
 
-            # Default row values
             row_data = {
                 "SLIN": slin_value,
                 "ACRN": "",
@@ -90,13 +84,6 @@ def award(document):
                 "Purchase Req No": ""
             }
 
-            # Check each attribute inside the rectangle
-            # attr = string to look for
-            # col_name = the df column that we will insert our value into
-            # width is the size of the scanning box (ten billion is wider than ten)
-            # height is the verticle size of scan box
-            # boolean at the end -> True = search below, False = search right
-            
             for attr, col_name, width, height, is_below in [
                 (acrn_id, "ACRN", 20, 0, False),
                 (unit_id, "Unit", 0, 15, True),
@@ -107,23 +94,37 @@ def award(document):
                 (purchase_requisition_id, "Purchase Req No", 60, 0, False)
             ]:
                 if not attr:
-                    continue  # Skip if string not set
+                    continue
 
                 hits = page.search_for(attr, clip=search_rect)
                 if hits:
-                    # Take first match ("a" is attribute)
                     ax0, ay0, ax1, ay1 = hits[0]
-                    
-                    # scan below attribute if value is below
                     if is_below:
                         value = page.get_textbox((ax0, ay1, ax1, ay1 + height)).strip() or ""
-                        
-                    # otherwise, scan right
                     else:
                         value = page.get_textbox((ax1, ay0, ax1 + width, ay1)).strip() or ""
                     row_data[col_name] = value
 
             df = pd.concat([df, pd.DataFrame([row_data])], ignore_index=True)
+
+    # PASS 2: Fill in missing Costs from CIN matches.
+    # For context: CINs are associated with price values, which are identified later in the document. 
+    # Pass 1 collects CINs, but NOT prices. Pass 2 collects prices and fills in the appropriate cells
+    for idx, row in df.iterrows():
+        if row["CIN"] and not row["Cost"]:  # CIN exists AND Cost is blank (don't want to overwrite if the table already handed us the price)
+            cin_to_find = row["CIN"]
+
+            for page in document:
+                hits = page.search_for(cin_to_find)
+                if hits:
+                    ax0, ay0, ax1, ay1 = hits[0]
+                    
+                    # grab a rectangle of text to the right of the CIN. This is the price that the CIN is associated with
+                    price = page.get_textbox((ax1, ay0, ax1 + 200, ay1)).strip()
+                    if price:
+                        price = sanitize_cin_value(price)
+                        df.at[idx, "Cost"] = price
+                        break
 
     # Save Excel file
     contract_number = sanitize_filename(contract_number)
@@ -140,12 +141,25 @@ def extract_underneath(page, search_text, dx, dy):
     return ""
 
 
+# This is used to avoid errors with PyMuPDF when it tries to write to Excel
 def sanitize_filename(value):
     # Remove illegal filename chars on Windows:  \ / : * ? " < > | and strip spaces
     value = re.sub(r'[\\/*?:"<>|]', "", value)
     # Replace newlines/tabs with underscore
     value = re.sub(r'[\r\n\t]+', "_", value)
     return value.strip()
+
+
+# This was made to avoid the issue of multiple prices being inputted into one price cell. This issue occured because the prices are very close together in the pdf.
+def sanitize_cin_value(string):
+    prices = re.findall(r'\$\d{1,3}(?:,\d{3})*(?:\.\d{2})?', string)
+
+    if len(prices) == 3:
+        return prices[1]  # middle price
+    elif len(prices) == 2:
+        return prices[0]  # first price
+    else:
+        return string # return original if 1 price or anything else
 
 
 def main():
