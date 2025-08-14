@@ -17,7 +17,10 @@ obligation_id = "NET AMT " # right
 cost_id = "UNIT PRICE " # under
 cin_id = "CIN: " # right
 funding_document_id = "Funding " # right
-purchase_requisition_id = "PURCHASE REQUEST NUMBER: " # right
+purchase_requisition_id = "PURCHASE REQUEST NUMBER: " # right\
+    
+    
+mod_contract_number_id = "MOD. OF CONTRACT/ORDER NO. "
 
 
 def determine_document_type(document):
@@ -48,9 +51,45 @@ def process_all_pdfs(input_root):
         elif determine_document_type(doc) == "award":
             award(doc)
 
-# grabs the data from tables in a mod doc. Under construction
+# grabs the data from tables in a mod doc.
 def mod(document):
-    print("goomba")
+    columns = ["SUBCLIN", "ACRN", "CIN", "Original Amount", "New Amount", "Difference"]
+    df = pd.DataFrame(columns=columns)
+
+    # Go through all pages and grab all text
+    for page in document:
+        text = page.get_text("text")
+        
+        # Match lines like: SUBCLIN 000103: <newline> AA: <...> (CIN 130069225500002) was decreased by $260 from $19,845 to $19,585.
+        pattern = re.compile(
+            r"SUBCLIN\s+(\d+):\s*[\r\n]+([A-Z]{2}):.*?\(CIN\s+(\d+)\).*?"
+            r"was\s+(?:increased|decreased)\s+by\s+\$([\d,]+)\s+from\s+\$?([\d,]+)\s+to\s+\$?([\d,]+)",
+            re.IGNORECASE | re.DOTALL
+        )
+
+        for match in pattern.finditer(text):
+            subclin = match.group(1)
+            acrn = match.group(2)
+            cin = match.group(3)
+            diff = match.group(4).replace(",", "")
+            original = match.group(5).replace(",", "")
+            new = match.group(6).replace(",", "")
+
+            df = pd.concat([df, pd.DataFrame([{
+                "SUBCLIN": subclin,
+                "ACRN": acrn,
+                "CIN": cin,
+                "Original Amount": original,
+                "New Amount": new,
+                "Difference": diff
+            }])], ignore_index=True)
+
+    # Save to Excel
+    first_page = document[0]
+    mod_contract_number = extract_underneath(first_page, mod_contract_number_id, dx=10, dy=10)
+
+    df.to_excel(f"Mod-{mod_contract_number}.xlsx", index=False)
+
 
 def award(document):
     columns = ["SLIN", "ACRN", "Unit", "Cost", "Qty", "Obligation", "Action Type", "CIN", "Funding Doc", "Purchase Req No"]
@@ -130,9 +169,10 @@ def award(document):
     contract_number = sanitize_filename(contract_number)
     order_number = sanitize_filename(order_number)
     contractor_name = sanitize_filename(contractor_name)
-    df.to_excel(f"{contract_number} --- {order_number} --- {contractor_name}.xlsx", index=False)
+    df.to_excel(f"Award-{contract_number}-{order_number}-{contractor_name}.xlsx", index=False)
 
 
+# helper function that pulls strings underneath a given word on a page
 def extract_underneath(page, search_text, dx, dy):
     instance = page.search_for(search_text)
     if instance:
