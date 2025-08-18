@@ -1,43 +1,42 @@
-import fitz # this is a dependancy that needs to be downloaded
+import fitz
 import pandas as pd
 import re
 import os
-from pathlib import Path 
-import shutil
+import argparse
+from pathlib import Path
 
-# Strings that are associated with the values on the tables (the strings that the script needs to look for):
-contract_number_id = "CONTRACT NO." # under, push left and right wall a little
-order_number_id = "ORDER NUMBER " # under, push left and right wall a little
-contractor_name_id = "CONTRACTOR/" # under, push left and right wall a little
-slin_id = "ITEM NO " # under, a little left
-acrn_id = "ACRN " # right
-unit_id = "UNIT " # under
-quantity_id = "QUANTITY " # under
-obligation_id = "NET AMT " # right
-cost_id = "UNIT PRICE " # under
-cin_id = "CIN: " # right
-funding_document_id = "Funding " # right
-purchase_requisition_id = "PURCHASE REQUEST NUMBER: " # right\
-    
-    
+# Strings that are associated with the values on the tables
+contract_number_id = "CONTRACT NO."
+order_number_id = "ORDER NUMBER "
+contractor_name_id = "CONTRACTOR/"
+slin_id = "ITEM NO "
+acrn_id = "ACRN "
+unit_id = "UNIT "
+quantity_id = "QUANTITY "
+obligation_id = "AMOUNT "
+cost_id = "UNIT PRICE "
+cin_id = "CIN: "
+funding_document_id = "Funding "
+purchase_requisition_id = "PURCHASE REQUEST NUMBER: "
 mod_contract_number_id = "MOD. OF CONTRACT/ORDER NO. "
 
 
-def determine_document_type(document):
-    first_page = document[0]
-    if first_page.search_for("AMENDMENT"):
-        return "mod"
-    else:
-        return "award"
-    
-# Get all PDF files from a given root directory
-def find_all_pdfs(root_path):
+# Get all PDF files from a given root directory that contain "award" or "original contract" in the filename
+def find_award_pdfs(root_path):
     root = Path(root_path)
-    return list(root.rglob("*.pdf"))
+    return [
+        p for p in root.rglob("*.pdf") 
+        if "award" in p.name.lower() or "original contract" in p.name.lower()
+    ]
 
-def process_all_pdfs(input_root):
-    pdf_paths = find_all_pdfs(input_root)
-    print(f"Found {len(pdf_paths)} PDF(s) to process in {input_root}.\n")
+
+def process_all_award_pdfs(input_root):
+    pdf_paths = find_award_pdfs(input_root)
+    print(f"Found {len(pdf_paths)} Award PDF(s) to process in {input_root}.\n")
+
+    # always save outputs to Downloads/award_outputs
+    output_dir = Path.home() / "Downloads" / "award_outputs"
+    output_dir.mkdir(exist_ok=True)
 
     for i, path in enumerate(pdf_paths, 1):
         try:
@@ -46,61 +45,18 @@ def process_all_pdfs(input_root):
             print(f"Skipping {path} due to error: {e}")
             continue
         
-        if determine_document_type(doc) == "mod":
-            mod(doc)
-        elif determine_document_type(doc) == "award":
-            award(doc)
-
-# grabs the data from tables in a mod doc.
-def mod(document):
-    columns = ["SUBCLIN", "ACRN", "CIN", "Original Amount", "New Amount", "Difference"]
-    df = pd.DataFrame(columns=columns)
-
-    # Go through all pages and grab all text
-    for page in document:
-        text = page.get_text("text")
-        
-        # Match lines like: SUBCLIN 000103: <newline> AA: <...> (CIN 130069225500002) was decreased by $260 from $19,845 to $19,585.
-        pattern = re.compile(
-            r"SUBCLIN\s+(\d+):\s*[\r\n]+([A-Z]{2}):.*?\(CIN\s+(\d+)\).*?"
-            r"was\s+(?:increased|decreased)\s+by\s+\$([\d,]+)\s+from\s+\$?([\d,]+)\s+to\s+\$?([\d,]+)",
-            re.IGNORECASE | re.DOTALL
-        )
-
-        for match in pattern.finditer(text):
-            subclin = match.group(1)
-            acrn = match.group(2)
-            cin = match.group(3)
-            diff = match.group(4).replace(",", "")
-            original = match.group(5).replace(",", "")
-            new = match.group(6).replace(",", "")
-
-            df = pd.concat([df, pd.DataFrame([{
-                "SUBCLIN": subclin,
-                "ACRN": acrn,
-                "CIN": cin,
-                "Original Amount": original,
-                "New Amount": new,
-                "Difference": diff
-            }])], ignore_index=True)
-
-    # Save to Excel
-    first_page = document[0]
-    mod_contract_number = extract_underneath(first_page, mod_contract_number_id, dx=10, dy=10)
-
-    df.to_excel(f"Mod-{mod_contract_number}.xlsx", index=False)
+        print(f"[{i}/{len(pdf_paths)}] Processing: {path}")
+        award(doc, output_dir)  # save into Downloads/award_outputs
 
 
-def award(document):
-    columns = ["SLIN", "ACRN", "Unit", "Cost", "Qty", "Obligation", "Action Type", "CIN", "Funding Doc", "Purchase Req No"]
+def award(document, output_dir):
+    columns = ["SLIN", "ACRN", "Unit", "Cost", "Qty", "Obligation", 
+               "Action Type", "CIN", "Funding Doc", "Purchase Req No"]
     df = pd.DataFrame(columns=columns)
 
     first_page = document[0]
-
-    # Extract contract/order/contractor names from page 1
-    contract_number = extract_underneath(first_page, contract_number_id, dx=5, dy=10)
-    order_number = extract_underneath(first_page, order_number_id, dx=5, dy=10)
-    contractor_name = extract_underneath(first_page, contractor_name_id, dx=5, dy=10)
+    contract_number = extract_underneath(first_page, contract_number_id, dx_left=3, dx_right=20, dy=8)
+    order_number = extract_underneath(first_page, order_number_id, dx_left=3, dx_right=20, dy=8)
 
     # ---- PASS 1: Build initial table ----
     for page in document:
@@ -128,89 +84,106 @@ def award(document):
                 (unit_id, "Unit", 0, 15, True),
                 (cost_id, "Cost", 0, 15, True),
                 (cin_id, "CIN", 100, 0, False),
-                (obligation_id, "Obligation", 200, 0, False),
+                (quantity_id, "Qty", 0, 8, True),
+                (obligation_id, "Obligation", 50, 15, True),
                 (funding_document_id, "Funding Doc", 100, 0, False),
                 (purchase_requisition_id, "Purchase Req No", 60, 0, False)
             ]:
-                if not attr:
-                    continue
-
                 hits = page.search_for(attr, clip=search_rect)
                 if hits:
                     ax0, ay0, ax1, ay1 = hits[0]
                     if is_below:
-                        value = page.get_textbox((ax0, ay1, ax1, ay1 + height)).strip() or ""
+                        value = page.get_textbox((ax0 - width, ay1, ax1, ay1 + height)).strip() or ""
                     else:
                         value = page.get_textbox((ax1, ay0, ax1 + width, ay1)).strip() or ""
                     row_data[col_name] = value
 
             df = pd.concat([df, pd.DataFrame([row_data])], ignore_index=True)
 
-    # PASS 2: Fill in missing Costs from CIN matches.
-    # For context: CINs are associated with price values, which are identified later in the document. 
-    # Pass 1 collects CINs, but NOT prices. Pass 2 collects prices and fills in the appropriate cells
+    # ---- PASS 2: Fill in missing Costs from CIN matches ----
     for idx, row in df.iterrows():
-        if row["CIN"] and not row["Cost"]:  # CIN exists AND Cost is blank (don't want to overwrite if the table already handed us the price)
+        if row["CIN"] and not row["Cost"]:
             cin_to_find = row["CIN"]
-
             for page in document:
                 hits = page.search_for(cin_to_find)
                 if hits:
                     ax0, ay0, ax1, ay1 = hits[0]
-                    
-                    # grab a rectangle of text to the right of the CIN. This is the price that the CIN is associated with
                     price = page.get_textbox((ax1, ay0, ax1 + 200, ay1)).strip()
                     if price:
                         price = sanitize_cin_value(price)
-                        df.at[idx, "Cost"] = price
+                        
+                        # remove whitespace and any additional chars
+                        df.at[idx, "Cost"] = clean_cost(price)
                         break
 
-    # Save Excel file
+
+    # ---- Save CSV in Downloads/award_outputs ----
     contract_number = sanitize_filename(contract_number)
     order_number = sanitize_filename(order_number)
-    contractor_name = sanitize_filename(contractor_name)
-    df.to_excel(f"Award-{contract_number}-{order_number}-{contractor_name}.xlsx", index=False)
+    
+    # strip off trailing underscores and digits
+    contract_number = clean_contract_or_order(contract_number)
+    order_number = clean_contract_or_order(order_number)
+    
+    output_path = output_dir / f"Award {contract_number} Order {order_number}.csv"
+    df.to_csv(output_path, index=False)
+    print(f"  -> Saved {output_path}")
 
 
-# helper function that pulls strings underneath a given word on a page
-def extract_underneath(page, search_text, dx, dy):
+def extract_underneath(page, search_text, dx_left, dx_right, dy):
     instance = page.search_for(search_text)
     if instance:
         x0, y0, x1, y1 = instance[0]
-        return page.get_textbox((x0 - dx, y1, x1 + dx, y1 + dy)).strip()
+        return page.get_textbox((x0 - dx_left, y1, x1 + dx_right, y1 + dy)).strip()
     return ""
 
 
-# This is used to avoid errors with PyMuPDF when it tries to write to Excel
 def sanitize_filename(value):
-    # Remove illegal filename chars on Windows:  \ / : * ? " < > | and strip spaces
     value = re.sub(r'[\\/*?:"<>|]', "", value)
-    # Replace newlines/tabs with underscore
     value = re.sub(r'[\r\n\t]+', "_", value)
     return value.strip()
 
+def clean_contract_or_order(value: str) -> str:
+    """
+    Removes any underscore and trailing digits from the contract/order number.
+    Example: 'N0024418D0003_1' -> 'N0024418D0003'
+             'N6339418F0035_2' -> 'N6339418F0035'
+    """
+    return re.sub(r"_\d+$", "", value)
 
-# This was made to avoid the issue of multiple prices being inputted into one price cell. This issue occured because the prices are very close together in the pdf.
+def clean_cost(value: str) -> str:
+    """
+    Keeps only valid currency characters: $, digits, commas, and periods.
+    Example: ": \n  $183,866" -> "$183,866"
+    """
+    if not value:
+        return ""
+    # Remove everything except allowed characters
+    cleaned = re.sub(r"[^$\d,\.]", "", value)
+    return cleaned
+
 def sanitize_cin_value(string):
     prices = re.findall(r'\$\d{1,3}(?:,\d{3})*(?:\.\d{2})?', string)
-
     if len(prices) == 3:
         return prices[1]  # middle price
     elif len(prices) == 2:
         return prices[0]  # first price
     else:
-        return string # return original if 1 price or anything else
+        return string
 
 
 def main():
-    # get the path to the directory
-    input_root = ""
-    while not os.path.exists(input_root):
-        input_root = input("Enter the complete path to the folder that has the documents (For example, C:/Users/adam/Downloads/Data/F1): ")
-        if not os.path.exists(input_root):
-            print("Directory does not exist. Please try again.")
-    input_root = Path(f"{input_root}")
-    
-    process_all_pdfs(input_root)
+    parser = argparse.ArgumentParser(description="Process award PDFs and save CSVs to Downloads.")
+    parser.add_argument("input_root", help="Path to the root folder containing PDFs")
+    args = parser.parse_args()
 
-main()
+    input_root = Path(args.input_root)
+    if not input_root.exists():
+        print(f"Error: {input_root} does not exist.")
+        return
+    
+    process_all_award_pdfs(input_root)
+
+
+if __name__ == "__main__":
+    main()
