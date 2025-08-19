@@ -20,22 +20,32 @@ funding_document_id = "Funding "
 purchase_requisition_id = "PURCHASE REQUEST NUMBER: "
 mod_contract_number_id = "MOD. OF CONTRACT/ORDER NO. "
 
+# ---------------------------
+# Detect award vs mod
+# ---------------------------
+def determine_document_type(document):
+    first_page = document[0]
+    if first_page.search_for("AMENDMENT"):
+        return "mod"
+    else:
+        return "award"
 
-# Get all PDF files from a given root directory that contain "award" or "original contract" in the filename
+# ---------------------------
+# Find PDFs
+# ---------------------------
 def find_award_pdfs(root_path):
     root = Path(root_path)
     return [
         p for p in root.rglob("*.pdf") 
-        if "award" in p.name.lower() or "original contract" in p.name.lower()
+        if "award" in p.name.lower() or "original contract" in p.name.lower() or "mod" in p.name.lower()
     ]
-
 
 def process_all_award_pdfs(input_root):
     pdf_paths = find_award_pdfs(input_root)
-    print(f"Found {len(pdf_paths)} Award PDF(s) to process in {input_root}.\n")
+    print(f"Found {len(pdf_paths)} PDF(s) to process in {input_root}.\n")
 
     # always save outputs to Downloads/award_outputs
-    output_dir = Path.home() / "Downloads" / "award_outputs"
+    output_dir = Path.home() / "Downloads" / "contract_data"
     output_dir.mkdir(exist_ok=True)
 
     for i, path in enumerate(pdf_paths, 1):
@@ -44,11 +54,65 @@ def process_all_award_pdfs(input_root):
         except Exception as e:
             print(f"Skipping {path} due to error: {e}")
             continue
-        
-        print(f"[{i}/{len(pdf_paths)}] Processing: {path}")
-        award(doc, output_dir)  # save into Downloads/award_outputs
 
+        doc_type = determine_document_type(doc)
+        print(f"[{i}/{len(pdf_paths)}] Processing {doc_type.upper()}: {path}")
 
+        if doc_type == "mod":
+            mod(doc, output_dir)
+        else:
+            award(doc, output_dir)
+
+# ---------------------------
+# MOD FUNCTION
+# ---------------------------
+def format_price(value):
+    value = value.replace(",", "").strip()
+    try:
+        return f"${float(value):,.2f}"
+    except ValueError:
+        return value
+
+def mod(document, output_dir):
+    columns = ["SUBCLIN", "ACRN", "CIN", "Original Amount", "New Amount", "Difference"]
+    df = pd.DataFrame(columns=columns)
+
+    for page in document:
+        text = page.get_text("text")
+        pattern = re.compile(
+            r"SUBCLIN\s+(\d+):\s*[\r\n]+([A-Z]{2}):.*?\(CIN\s+(\d+)\).*?"
+            r"was\s+(?:increased|decreased)\s+by\s+\$([\d,]+)\s+from\s+\$?([\d,]+)\s+to\s+\$?([\d,]+)",
+            re.IGNORECASE | re.DOTALL
+        )
+
+        for match in pattern.finditer(text):
+            subclin = match.group(1)
+            acrn = match.group(2)
+            cin = match.group(3)
+            diff = format_price(match.group(4))
+            original = format_price(match.group(5))
+            new = format_price(match.group(6))
+
+            df = pd.concat([df, pd.DataFrame([{
+                "SUBCLIN": subclin,
+                "ACRN": acrn,
+                "CIN": cin,
+                "Original Amount": original,
+                "New Amount": new,
+                "Difference": diff
+            }])], ignore_index=True)
+
+    first_page = document[0]
+    mod_contract_number = extract_underneath(first_page, mod_contract_number_id, dx_left=10, dx_right=10, dy=10)
+
+    mod_contract_number = sanitize_filename(mod_contract_number)
+    output_path = output_dir / f"Mod-{mod_contract_number}.csv"
+    df.to_csv(output_path, index=False)
+    print(f"  -> Saved {output_path}")
+
+# ---------------------------
+# AWARD FUNCTION 
+# ---------------------------
 def award(document, output_dir):
     columns = ["SLIN", "ACRN", "Unit", "Cost", "Qty", "Obligation", 
                "Action Type", "CIN", "Funding Doc", "Purchase Req No"]
@@ -111,69 +175,53 @@ def award(document, output_dir):
                     price = page.get_textbox((ax1, ay0, ax1 + 200, ay1)).strip()
                     if price:
                         price = sanitize_cin_value(price)
-                        
-                        # remove whitespace and any additional chars
                         df.at[idx, "Cost"] = clean_cost(price)
                         break
 
+    # Save CSV in Downloads/contract_data
+    contract_number = sanitize_filename(clean_contract_or_order(contract_number))
+    order_number = sanitize_filename(clean_contract_or_order(order_number))
 
-    # ---- Save CSV in Downloads/award_outputs ----
-    contract_number = sanitize_filename(contract_number)
-    order_number = sanitize_filename(order_number)
-    
-    # strip off trailing underscores and digits
-    contract_number = clean_contract_or_order(contract_number)
-    order_number = clean_contract_or_order(order_number)
-    
     output_path = output_dir / f"Award {contract_number} Order {order_number}.csv"
     df.to_csv(output_path, index=False)
     print(f"  -> Saved {output_path}")
 
-
-def extract_underneath(page, search_text, dx_left, dx_right, dy):
+# ---------------------------
+# Helpers
+# ---------------------------
+def extract_underneath(page, search_text, dx_left=3, dx_right=20, dy=8): # returns the text found underneath a given string on a given page.
     instance = page.search_for(search_text)
     if instance:
         x0, y0, x1, y1 = instance[0]
         return page.get_textbox((x0 - dx_left, y1, x1 + dx_right, y1 + dy)).strip()
     return ""
 
-
-def sanitize_filename(value):
+def sanitize_filename(value): # issue solved: "\" and quotation marks in the script argument can throw an error in the code. Output path throws an error if filename has certain characters.
     value = re.sub(r'[\\/*?:"<>|]', "", value)
     value = re.sub(r'[\r\n\t]+', "_", value)
     return value.strip()
 
-def clean_contract_or_order(value: str) -> str:
-    """
-    Removes any underscore and trailing digits from the contract/order number.
-    Example: 'N0024418D0003_1' -> 'N0024418D0003'
-             'N6339418F0035_2' -> 'N6339418F0035'
-    """
+def clean_contract_or_order(value: str) -> str: # issue solved: unwanted characters being pulled into Contract No and Order No cells
     return re.sub(r"_\d+$", "", value)
 
-def clean_cost(value: str) -> str:
-    """
-    Keeps only valid currency characters: $, digits, commas, and periods.
-    Example: ": \n  $183,866" -> "$183,866"
-    """
+def clean_cost(value: str) -> str: # issue solved: whitespace and colons found in Cost cells
     if not value:
         return ""
-    # Remove everything except allowed characters
-    cleaned = re.sub(r"[^$\d,\.]", "", value)
-    return cleaned
+    return re.sub(r"[^$\d,\.]", "", value)
 
-def sanitize_cin_value(string):
+def sanitize_cin_value(string): # issue solved: multiple prices being placed into the Cost cells
     prices = re.findall(r'\$\d{1,3}(?:,\d{3})*(?:\.\d{2})?', string)
     if len(prices) == 3:
-        return prices[1]  # middle price
+        return prices[1]
     elif len(prices) == 2:
-        return prices[0]  # first price
+        return prices[0]
     else:
         return string
 
 
+# Main
 def main():
-    parser = argparse.ArgumentParser(description="Process award PDFs and save CSVs to Downloads.")
+    parser = argparse.ArgumentParser(description="Process Award and Mod PDFs, save CSVs to Downloads.")
     parser.add_argument("input_root", help="Path to the root folder containing PDFs")
     args = parser.parse_args()
 
@@ -183,7 +231,6 @@ def main():
         return
     
     process_all_award_pdfs(input_root)
-
 
 if __name__ == "__main__":
     main()
