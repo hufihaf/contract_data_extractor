@@ -23,5 +23,3 @@ A Python script designed to extract data from government contract PDF documents.
 Additionally, you can use the Streamlit interface:
 
 ```python -m streamlit run contract_streamlit.py```
-
-## Documentation
